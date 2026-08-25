@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Emoera · 每日速报 + 教程平台</title>
+  <meta name="description" content="AI 每日速报（时事 / 世界 / 新梗 / 云 / AI 模型）+ 教程资源共享平台" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%233ea4ec'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white'>⚡</text></svg>" />
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./vendor/github.min.css" id="hljsLight" />
+  <link rel="stylesheet" href="./vendor/github-dark.min.css" id="hljsDark" disabled />
+  <script>
+    // 提前恢复主题，避免暗色模式下的闪白
+    try {
+      var t = localStorage.getItem("emoera-theme");
+      if (t === "dark") document.documentElement.dataset.theme = "dark";
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#/daily/home">
+        <span class="logo">⚡</span>
+        <span class="brand-text">
+          <b>Emoera</b>
+          <small>每日速报 · 教程平台</small>
+        </span>
+      </a>
+
+      <nav class="board-tabs" id="boardTabs" role="tablist" aria-label="板块切换">
+        <a class="board-tab" href="#/daily/home" data-board="daily" role="tab">AI 每日速报</a>
+        <a class="board-tab" href="#/tutorial/platform" data-board="tutorial" role="tab">教程平台</a>
+      </nav>
+
+      <nav class="nav-pills" id="navPills"></nav>
+
+      <div class="header-actions">
+        <button class="icon-btn" id="settingsBtn" title="AI 设置">⚙️</button>
+        <button class="icon-btn" id="themeBtn" title="切换明暗主题">🌙</button>
+        <span id="userArea"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="site-main" id="app"></main>
+
+  <footer class="site-footer">
+    <span>数据来源：RSS 聚合 · 由 AI 总结整理</span>
+    <span class="generated-at" id="generatedAt"></span>
+  </footer>
+
+  <!-- 设置弹窗 -->
+  <div id="settingsModal" class="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>⚙️ AI 设置</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="hint">配置 OpenAI 兼容接口（DeepSeek / OpenAI / 通义 / 智谱 等），Key 仅保存在本地后端，不会上传到第三方。</p>
+        <label class="field">
+          <span>服务商模板</span>
+          <select id="cfgProvider"><option value="">— 自定义 —</option></select>
+          <small>选择后自动填入 Base URL</small>
+        </label>
+        <label class="field">
+          <span>API Base URL</span>
+          <input id="cfgBaseUrl" type="text" placeholder="https://api.deepseek.com/v1" />
+          <small>仅支持公网 https/http，内网地址会被安全拦截</small>
+        </label>
+        <div class="field">
+          <span>模型</span>
+          <div class="model-row">
+            <input id="cfgModel" type="text" list="modelList" placeholder="deepseek-chat / gpt-4o-mini" />
+            <button id="fetchModelsBtn" class="btn btn-ghost btn-sm" type="button" title="从服务商自动拉取模型列表">🔄 获取模型</button>
+          </div>
+          <datalist id="modelList"></datalist>
+          <small id="modelsStatus" class="key-status"></small>
+        </div>
+        <label class="field">
+          <span>API Key</span>
+          <input id="cfgApiKey" type="password" placeholder="sk-..." autocomplete="off" />
+          <small id="keyStatus" class="key-status"></small>
+          <button id="clearKeyBtn" class="btn-link" type="button" hidden>🗑️ 清除已保存的 Key</button>
+        </label>
+        <label class="field" id="adminTokenField" hidden>
+          <span>管理令牌</span>
+          <input id="cfgAdminToken" type="password" placeholder="后端 EMOERA_ADMIN_TOKEN 的值" autocomplete="off" />
+          <small>修改 / 测试配置需要该令牌</small>
+        </label>
+        <div id="testResult" class="test-result" hidden></div>
+      </div>
+      <div class="modal-foot">
+        <button id="testBtn" class="btn btn-ghost">测试连接</button>
+        <span class="flex-spacer"></span>
+        <button id="cancelBtn" class="btn btn-ghost" data-close>取消</button>
+        <button id="saveBtn" class="btn btn-primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./vendor/marked.min.js"></script>
+  <script src="./vendor/purify.min.js"></script>
+  <script src="./vendor/highlight.min.js"></script>
+  <script src="./main.js"></script>
+</body>
+</html>

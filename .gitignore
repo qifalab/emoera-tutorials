@@ -1,0 +1,29 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ===== 环境变量（含密钥，绝不可入库）=====
+.env
+backend/.env
+*.local
+
+# ===== 运行时数据（AI key、用户、资源等敏感/可变数据，绝不可入库）=====
+backend/app/data/
+backend/.last_test_token
+
+# ===== 日志 =====
+*.log
+
+# ===== 工作区/本地工具目录 =====
+.workbuddy/
+_hd_profile/
+
+# ===== Node / 前端 =====
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
