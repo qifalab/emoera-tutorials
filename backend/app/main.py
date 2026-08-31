@@ -113,6 +113,25 @@ async def download_upload(filename: str):
     )
 
 
+# 仅位图类扩展名允许内联预览（教程正文 / 封面图内嵌显示用）。
+# SVG/HTML 等仍走上面的 attachment 下载，防止存储型 XSS。
+_INLINE_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+@app.get("/uploads/inline/{filename}")
+async def preview_upload(filename: str):
+    """内联预览上传的位图（正文图片显示用）。非位图一律拒绝内联。"""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", filename) or ".." in filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _INLINE_IMAGE_EXT:
+        raise HTTPException(status_code=400, detail="该类型不支持内联预览")
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(file_path, media_type=f"image/{ext.lstrip('.')}")
+
+
 @app.get("/api/health")
 async def health() -> dict:
     """健康检查端点，供前端/探针使用。"""

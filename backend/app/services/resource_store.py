@@ -60,12 +60,21 @@ def _save(resources: list) -> None:
 
 
 def _load_interactions() -> dict:
-    """加载互动数据：{likes: {res_id: [user_id]}, favorites: {...}, comments: [...]}"""
+    """加载互动数据：{likes: {res_id: [user_id]}, favorites: {...}, comments: [...], comment_likes: {comment_id: [user_id]}}"""
     try:
         with open(INTERACTIONS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:  # noqa: BLE001
-        return {"likes": {}, "favorites": {}, "comments": []}
+        return {"likes": {}, "favorites": {}, "comments": [], "comment_likes": {}}
+
+
+def _load_interactions_raw() -> dict:
+    """加载互动数据原始结构（不补默认值）。"""
+    try:
+        with open(INTERACTIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {"likes": {}, "favorites": {}, "comments": [], "comment_likes": {}}
 
 
 def _save_interactions(data: dict) -> None:
@@ -310,6 +319,13 @@ def list_by_author(author_id: str) -> list:
     return out
 
 
+def list_by_author_raw(author_id: str) -> list:
+    """某用户发布的全部资源原样记录（不含互动计数），供统计聚合。"""
+    with _LOCK:
+        resources = _load()
+    return [r for r in resources if r["author_id"] == author_id]
+
+
 def update_status(res_id: str, status: str, note: str = "") -> Optional[dict]:
     """更新资源审核状态。返回更新后的记录，未找到返回 None。"""
     with _LOCK:
@@ -438,9 +454,124 @@ def list_comments(res_id: str) -> list:
     """返回某资源的所有评论（按时间正序，楼中楼靠 parent_id 关联）。"""
     with _LOCK:
         inter = _load_interactions()
-    comments = [c for c in inter.get("comments", []) if c.get("resource_id") == res_id]
+    comments = [
+        _with_comment_meta(c, inter, "")
+        for c in inter.get("comments", [])
+        if c.get("resource_id") == res_id
+    ]
     comments.sort(key=lambda c: c.get("created_at", ""))
     return comments
+
+
+def list_comments_sorted(res_id: str, viewer_id: str = "", sort: str = "time") -> list:
+    """返回某资源的评论，支持排序（time 时间正序 / hot 热度=点赞数降序）。"""
+    with _LOCK:
+        inter = _load_interactions()
+    comments = [
+        _with_comment_meta(c, inter, viewer_id)
+        for c in inter.get("comments", [])
+        if c.get("resource_id") == res_id
+    ]
+    if sort == "hot":
+        comments.sort(key=lambda c: (-c.get("likes", 0), c.get("created_at", "")))
+    else:
+        comments.sort(key=lambda c: c.get("created_at", ""))
+    return comments
+
+
+def _with_comment_meta(c: dict, inter: dict, viewer_id: str) -> dict:
+    """给评论注入点赞数 / 是否已赞 / 被回复人昵称。"""
+    c = dict(c)
+    c["likes"] = len(inter.get("comment_likes", {}).get(c["id"], []))
+    c["liked"] = viewer_id in inter.get("comment_likes", {}).get(c["id"], []) if viewer_id else False
+    # 补被回复人昵称
+    if c.get("parent_id") and not c.get("reply_to_name"):
+        parent = next((x for x in inter.get("comments", []) if x.get("id") == c["parent_id"]), None)
+        c["reply_to_name"] = parent.get("author_name", "") if parent else ""
+    return c
+
+
+def toggle_comment_like(comment_id: str, user_id: str) -> dict:
+    """切换评论点赞。返回 {liked, likes}。若评论不存在返回 None。"""
+    with _LOCK:
+        inter = _load_interactions()
+        exists = any(c.get("id") == comment_id for c in inter.get("comments", []))
+        if not exists:
+            return None
+        likes = inter.setdefault("comment_likes", {}).setdefault(comment_id, [])
+        if user_id in likes:
+            likes.remove(user_id)
+            liked = False
+        else:
+            likes.append(user_id)
+            liked = True
+        _save_interactions(inter)
+    return {"liked": liked, "likes": len(likes)}
+
+
+def get_comment(comment_id: str) -> Optional[dict]:
+    """按 id 取单条评论（含互动元信息）。"""
+    with _LOCK:
+        inter = _load_interactions()
+    for c in inter.get("comments", []):
+        if c.get("id") == comment_id:
+            return _with_comment_meta(c, inter, "")
+    return None
+
+
+def delete_comment(comment_id: str) -> Optional[dict]:
+    """删除评论（本人或管理员）。返回被删评论，不存在返回 None。"""
+    with _LOCK:
+        inter = _load_interactions()
+        comments = inter.get("comments", [])
+        target = next((c for c in comments if c.get("id") == comment_id), None)
+        if not target:
+            return None
+        inter["comments"] = [c for c in comments if c.get("id") != comment_id and c.get("parent_id") != comment_id]
+        inter.setdefault("comment_likes", {}).pop(comment_id, None)
+        _save_interactions(inter)
+    return target
+
+
+def delete_resource(res_id: str) -> Optional[dict]:
+    """删除资源（作者或管理员）。级联清理其点赞/收藏/评论，并删除附件。"""
+    with _LOCK:
+        resources = _load()
+        target = next((r for r in resources if r["id"] == res_id), None)
+        if not target:
+            return None
+        resources = [r for r in resources if r["id"] != res_id]
+        _save(resources)
+
+        inter = _load_interactions()
+        inter.get("likes", {}).pop(res_id, None)
+        inter.get("favorites", {}).pop(res_id, None)
+        # 级联删除该资源所有评论及其点赞
+        cids = {c["id"] for c in inter.get("comments", []) if c.get("resource_id") == res_id}
+        inter["comments"] = [c for c in inter.get("comments", []) if c.get("resource_id") != res_id]
+        for cid in cids:
+            inter.get("comment_likes", {}).pop(cid, None)
+        _save_interactions(inter)
+    # 删除物理附件（尽力而为）
+    fp = target.get("file_path", "")
+    if fp.startswith("/uploads/"):
+        abs_path = os.path.join(UPLOAD_DIR, os.path.basename(fp))
+        try:
+            if os.path.isfile(abs_path):
+                os.remove(abs_path)
+        except OSError:
+            pass
+    return target
+
+
+def get_author(res_id: str) -> Optional[str]:
+    """返回资源作者 user_id。"""
+    with _LOCK:
+        resources = _load()
+    for r in resources:
+        if r["id"] == res_id:
+            return r.get("author_id")
+    return None
 
 
 def liked_by(res_id: str, user_id: str) -> bool:
@@ -468,3 +599,8 @@ def list_favorites(user_id: str) -> list:
     out = [_with_counts(r, inter) for r in out]
     out.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     return out
+
+
+def search_all(q: str, sort: str = "latest", limit: int = 50) -> list:
+    """全站搜索：匹配标题/简介/标签/作者（已通过资源），按 sort 排序。"""
+    return list_approved(q=q, sort=sort)[:limit]

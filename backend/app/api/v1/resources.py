@@ -6,12 +6,14 @@ from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.schemas.tutorial import (
     CommentCreate,
     CommentItem,
+    CommentSort,
     ResourceDetail,
     ResourceItem,
     ResourceUpdate,
     UserPublic,
 )
 from app.services import resource_store
+from app.services import notifications as notif
 from app.services.link_safety import validate_external_link
 
 router = APIRouter(prefix="/resources", tags=["resources"])
@@ -32,6 +34,16 @@ def _check_link(link: str) -> None:
     err = validate_external_link(link)
     if err:
         raise HTTPException(status_code=400, detail=err)
+
+
+def _normalize_category(category: str) -> str:
+    """分类兜底：不合法时回退到固定清单第一项，避免任意字符串污染分类维度。"""
+    from app.services import category_store
+    name = (category or "").strip()
+    cats = category_store.list_categories()
+    if name not in cats:
+        return cats[0] if cats else "教程"
+    return name
 
 
 @router.post("", response_model=ResourceItem)
@@ -70,7 +82,7 @@ async def upload_resource(
     rec = resource_store.add_resource(
         title=title.strip(),
         description=description,
-        category=category,
+        category=_normalize_category(category),
         tags=tag_list,
         link=link,
         image_url=image_url.strip(),
@@ -112,6 +124,32 @@ async def list_resource_categories():
     return {"categories": resource_store.list_categories()}
 
 
+@router.get("/category-options")
+async def list_category_options():
+    """固定分类选项（上传/编辑资源时下拉选择，管理员可维护）。"""
+    from app.services import category_store
+    return {"options": category_store.list_categories()}
+
+
+@router.get("/search")
+async def search_resources(
+    q: str = "",
+    sort: str = "latest",
+    category: str = "",
+):
+    """全站搜索：关键词 + 可选分类 + 排序，返回已通过资源。"""
+    if sort not in SORT_CHOICES:
+        sort = "latest"
+    return [
+        ResourceItem(**r)
+        for r in resource_store.list_approved(
+            category=category or None,
+            q=q or None,
+            sort=sort,
+        )
+    ]
+
+
 @router.get("/favorites", response_model=list[ResourceItem])
 async def list_my_favorites(user: UserPublic = Depends(get_current_user)):
     """当前用户收藏的资源列表。"""
@@ -131,7 +169,10 @@ async def get_resource_detail(
 ):
     """资源详情：含评论列表 + 当前用户点赞/收藏状态。"""
     rec = _require_approved(res_id)
-    comments = [CommentItem(**c) for c in resource_store.list_comments(res_id)]
+    comments = [
+        CommentItem(**c)
+        for c in resource_store.list_comments_sorted(res_id, viewer_id=(user.id if user else ""), sort="time")
+    ]
     liked = False
     favorited = False
     if user is not None:
@@ -166,7 +207,7 @@ async def edit_resource(
         res_id,
         title=body.title,
         description=body.description,
-        category=body.category,
+        category=_normalize_category(body.category),
         tags=body.tags,
         link=body.link,
         image_url=body.image_url.strip(),
@@ -198,11 +239,13 @@ async def toggle_favorite(res_id: str, user: UserPublic = Depends(get_current_us
     return resource_store.toggle_favorite(res_id, user.id)
 
 
-@router.get("/{res_id}/comments", response_model=list[CommentItem])
-async def list_comments(res_id: str):
-    """某资源的评论列表。"""
+@router.get("/{res_id}/comments")
+async def list_comments(res_id: str, sort: str = "time"):
+    """某资源的评论列表，支持 sort=time|hot 排序。"""
     _require_approved(res_id)
-    return [CommentItem(**c) for c in resource_store.list_comments(res_id)]
+    if sort not in ("time", "hot"):
+        sort = "time"
+    return [CommentItem(**c) for c in resource_store.list_comments_sorted(res_id, sort=sort)]
 
 
 @router.post("/{res_id}/comments", response_model=CommentItem)
@@ -213,11 +256,113 @@ async def create_comment(
 ):
     """发表评论（可带 parent_id 楼中楼回复，需登录）。"""
     _require_approved(res_id)
+    # 屏蔽校验：被屏蔽者不能评论
+    parent = None
+    if body.parent_id:
+        parent = resource_store.get_comment(body.parent_id)
+        if not parent:
+            raise HTTPException(status_code=404, detail="被回复的评论不存在")
+        # 与父评论作者互相屏蔽 → 禁止回复
+        if notif.is_blocked_either(user.id, parent.get("author_id", "")):
+            raise HTTPException(status_code=403, detail="你与对方已互相屏蔽，无法回复")
+    content = body.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="评论内容不能为空")
     comment = resource_store.add_comment(
         res_id=res_id,
         author_id=user.id,
         author_name=user.username,
-        content=body.content.strip(),
+        content=content,
         parent_id=body.parent_id,
     )
+    # 通知：回复评论 → 通知被回复人；否则通知资源作者
+    res = resource_store.get_resource(res_id)
+    if parent:
+        notif.notify(
+            user_id=parent["author_id"],
+            type_="reply_comment",
+            actor_id=user.id, actor_name=user.username,
+            target_id=res_id,
+            content=f"{user.username} 回复了你的评论：{content[:50]}",
+            link=f"#/tutorial/resource?id={res_id}",
+        )
+    elif res and res.get("author_id") and res["author_id"] != user.id:
+        notif.notify(
+            user_id=res["author_id"],
+            type_="reply_post",
+            actor_id=user.id, actor_name=user.username,
+            target_id=res_id,
+            content=f"{user.username} 评论了你的资源《{res.get('title','')[:30]}》：{content[:50]}",
+            link=f"#/tutorial/resource?id={res_id}",
+        )
     return CommentItem(**comment)
+
+
+@router.post("/{res_id}/comments/{comment_id}/like")
+async def toggle_comment_like(
+    res_id: str,
+    comment_id: str,
+    user: UserPublic = Depends(get_current_user),
+):
+    """评论点赞/取消点赞（需登录）。"""
+    _require_approved(res_id)
+    result = resource_store.toggle_comment_like(comment_id, user.id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="评论不存在")
+    comment = resource_store.get_comment(comment_id)
+    if result.get("liked") and comment:
+        notif.notify(
+            user_id=comment.get("author_id", ""),
+            type_="like_comment",
+            actor_id=user.id, actor_name=user.username,
+            target_id=res_id,
+            content=f"{user.username} 赞了你的评论",
+            link=f"#/tutorial/resource?id={res_id}",
+        )
+    return result
+
+
+@router.delete("/{res_id}/comments/{comment_id}")
+async def delete_comment(
+    res_id: str,
+    comment_id: str,
+    user: UserPublic = Depends(get_current_user),
+):
+    """删除评论：评论作者本人或管理员可删。"""
+    _require_approved(res_id)
+    comment = resource_store.get_comment(comment_id)
+    if not comment:
+        raise HTTPException(status_code=404, detail="评论不存在")
+    if comment.get("author_id") != user.id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="只能删除自己的评论")
+    resource_store.delete_comment(comment_id)
+    return {"ok": True}
+
+
+@router.delete("/{res_id}")
+async def delete_resource(
+    res_id: str,
+    user: UserPublic = Depends(get_current_user),
+    reason: str = "",
+):
+    """删除资源：作者本人或管理员可删。管理员删除会给作者发系统通知（含原因）。"""
+    rec = resource_store.get_resource(res_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="资源不存在")
+    if rec.get("author_id") != user.id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="只能删除自己发布的资源")
+    title = rec.get("title", "")
+    author_id = rec.get("author_id", "")
+    resource_store.delete_resource(res_id)
+    # 管理员删他人帖 → 通知作者删帖原因
+    if user.role == "admin" and author_id and author_id != user.id:
+        notif.notify(
+            user_id=author_id,
+            type_="system",
+            actor_id=user.id, actor_name="管理员",
+            target_id=res_id,
+            content=f"你的资源《{title[:30]}》已被管理员删除。{'原因：' + reason if reason else '未说明原因'}",
+            link="",
+        )
+    return {"ok": True}
+

@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     # 安全：管理员邀请码（注册时携带此码即成为管理员；留空则无法创建管理员）
     admin_invite_code: str = ""
 
+    # 安全：登录令牌有效期（小时）。0 = 永不过期（不推荐公网开启）。
+    # 令牌默认 7 天过期一次，过期后用户需重新登录，避免令牌泄露被长期滥用。
+    token_ttl_hours: int = 168
+
     # 安全：基础抗 DDoS / 滥用
     # 每个客户端 IP 在窗口期内的最大请求数（写操作路径，如登录/注册/上传/评论）
     rate_limit_per_minute: int = 60

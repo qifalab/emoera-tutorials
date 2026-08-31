@@ -19,7 +19,7 @@
 </head>
 <body>
   <header class="site-header">
-    <div class="header-inner">
+    <div class="header-inner header-top">
       <a class="brand" href="#/daily/home">
         <span class="logo">⚡</span>
         <span class="brand-text">
@@ -33,13 +33,23 @@
         <a class="board-tab" href="#/tutorial/platform" data-board="tutorial" role="tab">教程平台</a>
       </nav>
 
-      <nav class="nav-pills" id="navPills"></nav>
-
       <div class="header-actions">
-        <button class="icon-btn" id="settingsBtn" title="AI 设置">⚙️</button>
+        <div class="header-search">
+          <input id="globalSearchInput" type="search" placeholder="搜索资源 / 教程 / 作者…" autocomplete="off" />
+          <div id="globalSearchSuggest" class="search-suggest" hidden></div>
+        </div>
+        <button class="icon-btn" id="settingsBtn" title="设置">⚙️</button>
         <button class="icon-btn" id="themeBtn" title="切换明暗主题">🌙</button>
+        <button class="icon-btn notify-btn" id="notifyBtn" title="消息通知" style="display:none">
+          <span class="notify-icon">🔔</span>
+          <span class="notify-badge" id="notifyBadge" hidden></span>
+        </button>
         <span id="userArea"></span>
       </div>
+    </div>
+
+    <div class="header-inner header-sub">
+      <nav class="nav-pills" id="navPills" aria-label="子导航"></nav>
     </div>
   </header>
 

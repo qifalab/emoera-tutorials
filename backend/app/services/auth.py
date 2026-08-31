@@ -31,8 +31,16 @@ TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
 _LOCK = threading.Lock()
 
 # 登录令牌：持久化到 tokens.json，后端重启后登录态依然有效。
-# 结构：{token: user_id}
-_tokens: dict[str, str] = {}
+# 结构：{token: {"uid": user_id, "ts": epoch}}（带签发时间，用于过期回收）。
+# 兼容旧格式 {token: "user_id_str"}：读取时自动识别。
+# 默认有效期 7 天，可通过 EMOERA_TOKEN_TTL_HOURS 调整（0 = 永不过期）。
+_tokens: dict[str, dict] = {}
+
+TOKEN_TTL_SECONDS = settings.token_ttl_hours * 3600 if settings.token_ttl_hours > 0 else 0
+
+
+def _now() -> float:
+    return time.time()
 
 
 def _load_tokens() -> dict:
@@ -43,12 +51,45 @@ def _load_tokens() -> dict:
         return {}
 
 
+def _normalize(tokens: dict) -> dict:
+    """把 tokens 统一为 {token: {"uid": str, "ts": float}}，兼容旧格式字符串值。"""
+    out = {}
+    for t, v in (tokens or {}).items():
+        if isinstance(v, dict):
+            out[t] = {"uid": str(v.get("uid", "")), "ts": float(v.get("ts", _now()))}
+        else:
+            # 旧格式：{token: "user_id"}，无签发时间，视为刚签发
+            out[t] = {"uid": str(v), "ts": _now()}
+    return out
+
+
+def _expired(rec: dict) -> bool:
+    """判断令牌是否已过期。TTL=0 表示永不过期。"""
+    if TOKEN_TTL_SECONDS <= 0:
+        return False
+    return (_now() - rec.get("ts", 0)) > TOKEN_TTL_SECONDS
+
+
 def _save_tokens(tokens: dict) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = TOKENS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(tokens, f, ensure_ascii=False, indent=2)
     os.replace(tmp, TOKENS_FILE)
+
+
+def _load_token_map() -> dict:
+    """从磁盘读取并归一化令牌，同时做一次轻量过期回收。"""
+    raw = _load_tokens()
+    norm = _normalize(raw)
+    changed = False
+    for t, rec in list(norm.items()):
+        if _expired(rec):
+            norm.pop(t, None)
+            changed = True
+    if changed:
+        _save_tokens(norm)
+    return norm
 
 # 登录限速：username -> (失败次数, 最早失败时间)
 _LOGIN_ATTEMPTS: dict[str, tuple[int, float]] = {}
@@ -159,10 +200,10 @@ def login(username: str, password: str) -> tuple[Optional[str], Optional[UserPub
     _clear_failures(username)
     token = secrets.token_hex(24)
     with _LOCK:
-        tokens = _load_tokens()
-        tokens[token] = user["id"]
+        tokens = _load_token_map()
+        tokens[token] = {"uid": user["id"], "ts": _now()}
         _save_tokens(tokens)
-        _tokens[token] = user["id"]
+        _tokens[token] = {"uid": user["id"], "ts": _now()}
     return token, UserPublic(
         id=user["id"],
         username=user["username"],
@@ -180,17 +221,39 @@ def user_counts() -> dict:
     }
 
 
+def get_user_by_id(user_id: str) -> Optional[dict]:
+    """按 user_id 取用户完整记录（含 role 等）。"""
+    users = _load_users()
+    for u in users.values():
+        if u.get("id") == user_id:
+            return dict(u)
+    return None
+
+
+def get_username(user_id: str) -> str:
+    """按 user_id 取用户名，未找到返回空串。"""
+    u = get_user_by_id(user_id)
+    return u.get("username", "") if u else ""
+
+
 def get_user_by_token(token: str) -> Optional[UserPublic]:
-    """由令牌解析用户。无效返回 None。"""
-    user_id = _tokens.get(token)
-    if not user_id:
+    """由令牌解析用户。无效或已过期返回 None。"""
+    rec = _tokens.get(token)
+    if not rec:
         # 内存未命中时从磁盘兜底（进程重启后 _tokens 为空）
-        try:
-            user_id = _load_tokens().get(token)
-        except Exception:  # noqa: BLE001
-            user_id = None
-        if not user_id:
-            return None
+        norm = _load_token_map()
+        rec = norm.get(token)
+        if rec:
+            _tokens[token] = rec  # 回填内存，减少后续磁盘 IO
+    if not rec:
+        return None
+    if _expired(rec):
+        _tokens.pop(token, None)
+        logout(token)
+        return None
+    user_id = rec.get("uid") if isinstance(rec, dict) else str(rec)
+    if not user_id:
+        return None
     users = _load_users()
     for u in users.values():
         if u["id"] == user_id:
@@ -204,8 +267,11 @@ def get_user_by_token(token: str) -> Optional[UserPublic]:
 
 
 def logout(token: str) -> None:
+    if not token:
+        return
     _tokens.pop(token, None)
     with _LOCK:
-        tokens = _load_tokens()
-        tokens.pop(token, None)
-        _save_tokens(tokens)
+        tokens = _load_token_map()
+        if token in tokens:
+            tokens.pop(token, None)
+            _save_tokens(tokens)

@@ -89,7 +89,9 @@ function mdRenderer() {
 
 function renderMarkdown(md) {
   if (!md) return "";
-  if (!window.marked) return linkify(md); // 未加载 marked 时退回纯链接化
+  // 安全兜底：marked 未加载时退回纯文本链接化（linkify 内部已 escapeHtml，
+  // 只生成受控的 <a> 标签，绝对不注入原始 HTML，杜绝 XSS）。
+  if (!window.marked) return linkify(md);
   let html = "";
   try {
     const renderer = mdRenderer();
@@ -98,14 +100,18 @@ function renderMarkdown(md) {
   } catch (e) {
     return linkify(md);
   }
-  // XSS 过滤：允许图片、链接、代码块等安全标签
+  // XSS 过滤：允许图片、链接、代码块等安全标签；DOMPurify 缺失时退回纯文本。
   if (window.DOMPurify) {
     html = DOMPurify.sanitize(html, {
       ADD_ATTR: ["target", "rel"],
       ALLOW_DATA_ATTR: false,
     });
+  } else {
+    // DOMPurify 也未加载：任何 markdown HTML 都不可信，退回纯文本链接化，宁缺毋滥。
+    return linkify(md);
   }
-  return html;
+  // 正文中相对路径图片（如 /uploads/xxx.png）补全为后端地址，修复显示失败
+  return absolutizeImages(html);
 }
 
 /* 为渲染后的 HTML 绑定交互（代码块复制按钮 + 语言切换） */
@@ -201,20 +207,57 @@ function fmtCount(n) {
   return String(n);
 }
 
+/* 媒体 URL 补全：把相对路径（/uploads/xxx）补成可访问的后端绝对地址。
+   前端零构建、与后端跨端口部署时，相对路径会 404——这是教程页图片显示失败的主因。 */
+function resolveMediaUrl(u) {
+  const s = String(u || "").trim();
+  if (!s) return "";
+  if (/^(https?:)?\/\//i.test(s)) return s;       // 已绝对
+  if (s.startsWith("/uploads/")) return API_BASE + "/uploads/inline/" + s.slice("/uploads/".length); // 位图走内联预览
+  if (s.startsWith("/")) return API_BASE + s;      // 根相对路径 → 拼后端
+  return s;
+}
+
+/* 把渲染后 HTML 里的相对路径 img src 补全为后端地址（DOMPurify 过滤之后做）。 */
+function absolutizeImages(html) {
+  if (!html || typeof html !== "string") return html;
+  return html.replace(/<img\b[^>]*\bsrc="([^"]+)"/gi, (whole, src) => {
+    if (/^(https?:)?\/\//i.test(src) || src.startsWith("data:")) return whole;
+    if (src.startsWith("/uploads/")) return whole.replace(src, API_BASE + "/uploads/inline/" + src.slice("/uploads/".length));
+    if (src.startsWith("/")) return whole.replace(src, API_BASE + src);
+    return whole;
+  });
+}
+
 /* ---------------- 会话 ---------------- */
-const TOKEN_KEY = "emoera_token";
 const USER_KEY = "emoera_user";
-const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
+/* 安全：令牌不再存 localStorage（XSS 可被窃取）。
+   登录时后端会写 httpOnly Cookie，前端所有请求由统一 fetch 包装自动携带。
+   这里仅保留用户信息用于界面展示（用户名/头像/角色），不包含任何凭证。 */
+const getToken = () => "";
 const getUser = () => { try { return JSON.parse(localStorage.getItem(USER_KEY) || "null"); } catch { return null; } };
-const setSession = (t, u) => { localStorage.setItem(TOKEN_KEY, t); localStorage.setItem(USER_KEY, JSON.stringify(u)); };
-const clearSession = () => { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY); };
-const authHeaders = (extra = {}) => {
-  const h = { "Content-Type": "application/json", ...extra };
-  const t = getToken();
-  if (t) h["Authorization"] = "Bearer " + t;
-  return h;
-};
+const setSession = (t, u) => { if (u) localStorage.setItem(USER_KEY, JSON.stringify(u)); };
+const clearSession = () => { localStorage.removeItem(USER_KEY); };
+const authHeaders = (extra = {}) => ({ "Content-Type": "application/json", ...extra });
 const requireLogin = () => { alert("请先登录"); location.hash = "#/tutorial/login"; };
+
+/* 统一 fetch 包装：
+   1. 自动携带 httpOnly Cookie（credentials:include，跨域凭据）
+   2. 极度向后兼容：若 localStorage 存有旧 token 也带上（迁移期兜底）
+   所有业务代码继续直接调用全局 fetch，无需改动。 */
+(function wrapFetch() {
+  const legacyToken = localStorage.getItem("emoera_token") || "";
+  const _orig = window.fetch.bind(window);
+  window.fetch = (url, opts = {}) => {
+    const o = { ...opts, credentials: "include" };
+    if (legacyToken) {
+      const h = { ...(opts.headers || {}) };
+      if (!h["Authorization"]) h["Authorization"] = "Bearer " + legacyToken;
+      o.headers = h;
+    }
+    return _orig(url, o);
+  };
+})();
 
 function avatarChar(u) { return (u || "?").slice(0, 1).toUpperCase(); }
 function avatarHue(u) {
@@ -246,19 +289,21 @@ function toggleTheme() {
 /* ---------------- 路由与导航 ---------------- */
 const NAV = {
   daily: [
-    { path: "home", label: "首页" },
-    { path: "news", label: "🗞️ 时事" },
-    { path: "world", label: "🌍 世界" },
-    { path: "meme", label: "😂 新梗" },
-    { path: "cloud", label: "☁️ 云厂商" },
-    { path: "cloud_native", label: "⚙️ 云原生" },
-    { path: "ai_cloud", label: "🤖 AI上云" },
-    { path: "ai_models", label: "🧠 AI模型" },
+    { path: "home", label: "首页", icon: "🏠" },
+    { path: "news", label: "时事", icon: "🗞️" },
+    { path: "world", label: "世界", icon: "🌍" },
+    { path: "meme", label: "新梗", icon: "😂" },
+    { path: "cloud", label: "云厂商", icon: "☁️" },
+    { path: "cloud_native", label: "云原生", icon: "⚙️" },
+    { path: "ai_cloud", label: "AI上云", icon: "🤖" },
+    { path: "ai_models", label: "AI模型", icon: "🧠" },
   ],
   tutorial: [
-    { path: "platform", label: "🏠 平台首页" },
-    { path: "resources", label: "📚 资源中心" },
-    { path: "upload", label: "⬆️ 上传资源" },
+    { path: "platform", label: "平台首页", icon: "🏠" },
+    { path: "resources", label: "资源中心", icon: "📚" },
+    { path: "upload", label: "上传资源", icon: "⬆️" },
+    { path: "favorites", label: "我的收藏", icon: "⭐" },
+    { path: "my_resources", label: "我的上传", icon: "📁" },
   ],
 };
 
@@ -296,13 +341,14 @@ function renderHeader(state) {
     a.classList.toggle("active", a.dataset.board === state.board);
   });
   const pills = $("navPills");
-  const items = state.board === "daily" ? NAV.daily : NAV.tutorial;
+  const items = NAV[state.board] || NAV.daily;
   if (pills) {
-    pills.innerHTML = items.map((it) =>
-      `<a class="nav-pill" href="#/${state.board}/${it.path}" data-nav="${it.path}">${it.label}</a>`).join("");
-    pills.querySelectorAll(".nav-pill").forEach((a) => {
-      a.classList.toggle("active", a.dataset.nav === state.page);
-    });
+    // 方形紧凑按钮置顶：当前展示页面对应按钮变蓝（bg-primary → 这里用 active 高亮）
+    pills.innerHTML = items.map((it) => {
+      const active = state.page === it.path;
+      return `<a class="nav-pill${active ? " active" : ""}" href="#/${state.board}/${it.path}" data-nav="${it.path}" role="tab" aria-selected="${active}">
+        <span class="nav-pill-icon">${it.icon}</span><span class="nav-pill-label">${it.label}</span></a>`;
+    }).join("");
   }
   const area = $("userArea");
   if (area) {
@@ -312,12 +358,76 @@ function renderHeader(state) {
       area.innerHTML = `<a class="nav-user" href="#/tutorial/profile" title="个人中心">
         <span class="nav-avatar" style="background:hsl(${hue},62%,52%)">${escapeHtml(avatarChar(u.username))}</span>
         <span class="nav-username">${escapeHtml(u.username)}</span></a>`;
+      const nb = $("notifyBtn");
+      if (nb) { nb.style.display = ""; pollUnread(); }
     } else {
       area.innerHTML = `<a class="btn btn-ghost btn-sm" href="#/tutorial/login">🔑 登录</a>`;
+      const nb = $("notifyBtn");
+      if (nb) { nb.style.display = "none"; }
     }
   }
   const g = $("generatedAt");
   if (g) g.textContent = "";
+  bindHeaderExtras();
+}
+
+/* 通知角标轮询 */
+let _unreadTimer = null;
+async function pollUnread() {
+  if (!getUser()) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/notifications/unread-count`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const badge = $("notifyBadge");
+    if (badge) {
+      badge.textContent = data.unread > 99 ? "99+" : String(data.unread);
+      badge.hidden = data.unread <= 0;
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+function bindHeaderExtras() {
+  const notifyBtn = $("notifyBtn");
+  on(notifyBtn, "click", () => { location.hash = "#/tutorial/notifications"; });
+
+  const input = $("globalSearchInput");
+  const suggest = $("globalSearchSuggest");
+  if (!input) return;
+  let debounce = null;
+  on(input, "input", () => {
+    clearTimeout(debounce);
+    const q = input.value.trim();
+    if (!q) { if (suggest) suggest.hidden = true; return; }
+    debounce = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/resources/search?q=${encodeURIComponent(q)}&sort=hottest`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!suggest) return;
+        if (!data.length) {
+          suggest.innerHTML = `<div class="ss-empty">未找到“${escapeHtml(q)}”相关资源</div>`;
+        } else {
+          suggest.innerHTML = data.slice(0, 8).map((r) =>
+            `<a class="ss-item" href="#/tutorial/resource?id=${escapeAttr(r.id)}">
+              <span class="ss-title">${escapeHtml(r.title)}</span>
+              <span class="ss-cat">${escapeHtml(r.category || "教程")}</span>
+            </a>`).join("") +
+            `<a class="ss-more" href="#/tutorial/search?q=${encodeURIComponent(q)}">查看全部结果 →</a>`;
+        }
+        suggest.hidden = false;
+      } catch (e) { /* 忽略 */ }
+    }, 220);
+  });
+  on(input, "keydown", (e) => {
+    if (e.key === "Enter") {
+      const q = input.value.trim();
+      if (q) { if (suggest) suggest.hidden = true; location.hash = `#/tutorial/search?q=${encodeURIComponent(q)}`; }
+    }
+  });
+  document.addEventListener("click", (e) => {
+    if (suggest && !suggest.contains(e.target) && e.target !== input) suggest.hidden = true;
+  });
 }
 
 /* ---------------- 视图：速报 ---------------- */
@@ -428,7 +538,7 @@ function renderModelItem(item, i) {
   const safeUrl = escapeAttr(item.url || "");
   const hasUrl = !!safeUrl;
   const img = item.image_url
-    ? `<div class="model-thumb"><img loading="lazy" src="${escapeAttr(item.image_url)}" alt="${escapeAttr(item.name)}" onerror="this.parentNode.style.display='none'" /></div>`
+    ? `<div class="model-thumb"><img loading="lazy" src="${escapeAttr(resolveMediaUrl(item.image_url))}" alt="${escapeAttr(item.name)}" referrerpolicy="no-referrer" onerror="this.parentNode.style.display='none'" /></div>`
     : "";
   const stats = [
     item.downloads ? `<span title="下载量">⬇️ ${fmtCount(item.downloads)}</span>` : "",
@@ -562,6 +672,20 @@ async function loadCategories() {
   } catch (e) { /* 分类加载失败不影响列表 */ }
 }
 
+/* 加载固定分类选项填充下拉（上传/编辑页），并保留当前选中值 */
+async function loadCategoryOptions(selectEl, current) {
+  if (!selectEl) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/resources/category-options`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const opts = data.options || [];
+    if (!opts.length) return;
+    selectEl.innerHTML = opts.map((o) =>
+      `<option value="${escapeAttr(o)}"${o === current ? " selected" : ""}>${escapeHtml(o)}</option>`).join("");
+  } catch (e) { /* 失败保留默认 */ }
+}
+
 async function loadResources() {
   const list = $("resList");
   const loading = $("resLoading");
@@ -607,7 +731,7 @@ function renderResourceCard(r) {
   }
   const fileMeta = r.file_name ? `<span title="文件名">📎 ${escapeHtml(r.file_name)}</span>` : "";
   const cover = r.image_url
-    ? `<div class="res-cover"><img src="${escapeAttr(r.image_url)}" alt="${escapeAttr(r.title)}" loading="lazy" onerror="this.parentNode.style.display='none'" /></div>`
+    ? `<div class="res-cover"><img src="${escapeAttr(resolveMediaUrl(r.image_url))}" alt="${escapeAttr(r.title)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.style.display='none'" /></div>`
     : "";
   return `<li class="res-card">
     ${cover}
@@ -618,7 +742,7 @@ function renderResourceCard(r) {
       </div>
       ${r.description ? `<div class="res-desc">${mdExcerpt(r.description)}</div>` : ""}
       <div class="res-meta">
-        <span title="作者">👤 ${escapeHtml(r.author_name || "匿名")}</span>
+        <span title="作者">👤 <a class="res-author" href="#/tutorial/user?id=${escapeAttr(r.author_id || "")}">${escapeHtml(r.author_name || "匿名")}</a></span>
         <span title="发布时间">🕒 ${escapeHtml(fmtTime(r.created_at))}</span>
         <span title="下载量">⬇️ ${r.downloads || 0}</span>
         ${fileMeta}
@@ -716,7 +840,7 @@ function initResourceFilters() {
 }
 
 async function handleLike(resId, btn) {
-  if (!getToken()) { requireLogin(); return; }
+  if (!getUser()) { requireLogin(); return; }
   try {
     const res = await fetch(`${API_BASE}/api/v1/resources/${resId}/like`, { method: "POST", headers: authHeaders() });
     const data = await res.json().catch(() => ({}));
@@ -728,7 +852,7 @@ async function handleLike(resId, btn) {
 }
 
 async function handleFavorite(resId, btn) {
-  if (!getToken()) { requireLogin(); return; }
+  if (!getUser()) { requireLogin(); return; }
   try {
     const res = await fetch(`${API_BASE}/api/v1/resources/${resId}/favorite`, { method: "POST", headers: authHeaders() });
     const data = await res.json().catch(() => ({}));
@@ -789,8 +913,12 @@ function renderUploadPage() {
           <input id="resTitle" type="text" maxlength="120" placeholder="例如：Stable Diffusion 入门教程" required />
         </label>
         <label class="field">
-          <span>分类</span>
-          <input id="resCategory" type="text" maxlength="40" placeholder="教程 / 模型 / 资料" value="教程" />
+          <span>分类（从固定选项中选择）</span>
+          <select id="resCategory" class="res-cat-select">
+            <option value="教程">教程</option>
+            <option value="模型">模型</option>
+            <option value="资料">资料</option>
+          </select>
         </label>
         <label class="field">
           <span>封面图 URL（可选，列表卡片展示）</span>
@@ -897,7 +1025,8 @@ async function initUpload() {
   if (!form) return;
   bindMdToolbar("res");
   bindMdPreview("res");
-  if (!getToken()) {
+  loadCategoryOptions($("resCategory"), "教程");
+  if (!getUser()) {
     setStatus(status, "请先登录后再上传（右上角「登录」）。", true);
     form.querySelectorAll("input, textarea, button").forEach((e) => (e.disabled = true));
     return;
@@ -918,7 +1047,6 @@ async function initUpload() {
     try {
       const res = await fetch(`${API_BASE}/api/v1/resources`, {
         method: "POST",
-        headers: { "Authorization": "Bearer " + getToken() },
         body: fd,
       });
       const data = await res.json().catch(() => ({}));
@@ -1034,8 +1162,12 @@ function renderEditPage() {
           <input id="editTitle" type="text" maxlength="120" required />
         </label>
         <label class="field">
-          <span>分类</span>
-          <input id="editCategory" type="text" maxlength="40" placeholder="教程 / 模型 / 资料" />
+          <span>分类（从固定选项中选择）</span>
+          <select id="editCategory" class="res-cat-select">
+            <option value="教程">教程</option>
+            <option value="模型">模型</option>
+            <option value="资料">资料</option>
+          </select>
         </label>
         <label class="field">
           <span>封面图 URL（可选）</span>
@@ -1069,7 +1201,7 @@ function renderEditPage() {
 async function loadEditPage() {
   const id = new URLSearchParams(location.hash.split("?")[1] || "").get("id");
   if (!id) { location.hash = "#/tutorial/my_resources"; return; }
-  if (!getToken()) { requireLogin(); return; }
+  if (!getUser()) { requireLogin(); return; }
   editResId = id;
   try {
     const res = await fetch(`${API_BASE}/api/v1/resources/mine`, { headers: authHeaders() });
@@ -1086,6 +1218,7 @@ async function loadEditPage() {
     $("editDesc").value = rec.description || "";
     $("editTags").value = (rec.tags || []).join(", ");
     $("editLink").value = rec.link || "";
+    loadCategoryOptions($("editCategory"), rec.category || "教程");
   } catch (err) {
     setStatus($("editStatus"), "⚠️ 加载失败：" + err.message, true);
   }
@@ -1153,18 +1286,30 @@ async function loadResourceDetail() {
   const wrap = $("detailWrap");
   if (loading) loading.hidden = false;
   try {
-    const headers = {};
-    if (getToken()) headers["Authorization"] = "Bearer " + getToken();
-    const res = await fetch(`${API_BASE}/api/v1/resources/${id}`, { headers });
+    // 认证交给 httpOnly Cookie，由全局 fetch 包装自动携带
+    const res = await fetch(`${API_BASE}/api/v1/resources/${id}`);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     renderDetail(data);
     if (loading) loading.hidden = true;
     if (wrap) wrap.hidden = false;
+    // 单独按当前排序拉评论
+    loadCommentsWithSort();
   } catch (err) {
     if (loading) loading.hidden = true;
     if (wrap) { wrap.hidden = false; wrap.innerHTML = `<div class="empty">⚠️ 加载失败：${escapeHtml(err.message)}</div>`; }
   }
+}
+
+async function loadCommentsWithSort() {
+  const list = $("commentList");
+  if (!list || !detailResId) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/resources/${detailResId}/comments?sort=${commentSort}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const comments = await res.json();
+    renderComments(comments);
+  } catch (e) { /* 忽略 */ }
 }
 
 function renderDetail(data) {
@@ -1182,13 +1327,17 @@ function renderDetail(data) {
   }
   const fileMeta = r.file_name ? `<span>📎 ${escapeHtml(r.file_name)}</span>` : "";
   const me = getUser();
-  // 作者本人可编辑；管理员可在后台审核，详情页也保留入口
+  // 作者本人可编辑；作者本人或管理员可删帖
   const canEdit = !!(me && me.id === r.author_id);
+  const canDelete = !!(me && (me.id === r.author_id || me.role === "admin"));
   const editBtn = canEdit
     ? `<button class="btn btn-ghost btn-sm" id="editResBtn" data-edit="${escapeAttr(r.id)}">✏️ 编辑</button>`
     : "";
+  const delBtn = canDelete
+    ? `<button class="btn btn-ghost btn-sm danger" id="delResBtn" data-del="${escapeAttr(r.id)}" title="${me && me.role === "admin" && me.id !== r.author_id ? "管理员删除（可填原因）" : "删除帖子"}">🗑️ 删除</button>`
+    : "";
   const cover = r.image_url
-    ? `<div class="detail-cover"><img src="${escapeAttr(r.image_url)}" alt="${escapeAttr(r.title)}" onerror="this.style.display='none'" /></div>`
+    ? `<div class="detail-cover"><img src="${escapeAttr(resolveMediaUrl(r.image_url))}" alt="${escapeAttr(r.title)}" referrerpolicy="no-referrer" onerror="this.style.display='none'" /></div>`
     : "";
   const wrap = $("detailWrap");
   wrap.innerHTML = `
@@ -1196,12 +1345,12 @@ function renderDetail(data) {
       <div class="res-head">
         <span class="res-cat">${escapeHtml(r.category || "教程")}</span>
         <h2 class="res-title">${escapeHtml(r.title)}</h2>
-        ${editBtn}
+        <span class="res-head-actions">${editBtn}${delBtn}</span>
       </div>
       ${cover}
       ${r.description ? `<div class="res-desc md-body">${renderMarkdown(r.description)}</div>` : ""}
       <div class="res-meta">
-        <span>👤 ${escapeHtml(r.author_name || "匿名")}</span>
+        <span>👤 <a class="res-author" href="#/tutorial/user?id=${escapeAttr(r.author_id || "")}">${escapeHtml(r.author_name || "匿名")}</a></span>
         <span>🕒 ${escapeHtml(fmtTime(r.created_at))}</span>
         <span>⬇️ ${r.downloads || 0}</span>
         ${fileMeta}
@@ -1215,7 +1364,13 @@ function renderDetail(data) {
       </div>
     </div>
     <div class="detail-comments">
-      <h3>💬 评论（${data.comments.length}）</h3>
+      <div class="detail-comments-head">
+        <h3>💬 评论（${data.comments.length}）</h3>
+        <div class="comment-sort">
+          <button class="csort-btn ${commentSort === "time" ? "active" : ""}" data-csort="time">🕒 按时间</button>
+          <button class="csort-btn ${commentSort === "hot" ? "active" : ""}" data-csort="hot">🔥 按热度</button>
+        </div>
+      </div>
       <div id="commentInput" class="comment-input">
         <textarea id="commentText" placeholder="写下你的评论或提问…"></textarea>
         <button id="commentSubmit" class="btn btn-primary">发表评论</button>
@@ -1227,6 +1382,8 @@ function renderDetail(data) {
   bindRenderedContent(wrap);
 }
 
+let commentSort = "time";
+
 function renderComments(comments) {
   const list = $("commentList");
   if (!list) return;
@@ -1234,30 +1391,62 @@ function renderComments(comments) {
     list.innerHTML = `<li class="item-empty">还没有评论，来抢沙发～</li>`;
     return;
   }
+  const me = getUser();
   const top = comments.filter((c) => !c.parent_id);
   const replies = comments.filter((c) => c.parent_id);
   const byParent = {};
   replies.forEach((c) => { (byParent[c.parent_id] = byParent[c.parent_id] || []).push(c); });
-  list.innerHTML = top.map((c) => renderComment(c, byParent)).join("");
+  list.innerHTML = top.map((c) => renderComment(c, byParent, me)).join("");
 }
 
-function renderComment(c, byParent) {
-  const children = (byParent[c.id] || []).map((r) => `
-    <li class="comment-item reply">
-      <div class="comment-head"><span class="comment-author">${escapeHtml(r.author_name)}</span>
-      <span class="comment-time">${escapeHtml(fmtTime(r.created_at))}</span></div>
-      <div class="comment-content">${escapeHtml(r.content)}</div>
-    </li>`).join("");
+function renderComment(c, byParent, me) {
+  const children = (byParent[c.id] || []).map((r) => renderReply(r, me)).join("");
+  const hue = avatarHue(c.author_name);
+  const isMine = !!(me && me.id === c.author_id);
+  const isAdmin = !!(me && me.role === "admin");
+  const canDelete = isMine || isAdmin;
   const replyBtn = `<button class="btn-link" data-reply="${escapeAttr(c.id)}" data-reply-to="${escapeAttr(c.author_name)}">回复</button>`;
+  const likeBtn = `<button class="btn-link cmt-like ${c.liked ? "active" : ""}" data-clike="${escapeAttr(c.id)}">👍 <span class="count">${c.likes || 0}</span></button>`;
+  const delBtn = canDelete ? `<button class="btn-link danger" data-cdel="${escapeAttr(c.id)}">删除</button>` : "";
+  const blockBtn = (me && me.id !== c.author_id) ? `<button class="btn-link danger" data-cblock="${escapeAttr(c.author_id)}" data-cname="${escapeAttr(c.author_name)}">屏蔽</button>` : "";
   return `
     <li class="comment-item">
-      <div class="comment-head">
-        <span class="comment-author">${escapeHtml(c.author_name)}</span>
-        <span class="comment-time">${escapeHtml(fmtTime(c.created_at))}</span>
+      <a class="comment-avatar" href="#/tutorial/user?id=${escapeAttr(c.author_id)}" title="查看 ${escapeAttr(c.author_name)} 的主页"
+         style="background:hsl(${hue},62%,52%)">${escapeHtml(avatarChar(c.author_name))}</a>
+      <div class="comment-main">
+        <div class="comment-head">
+          <a class="comment-author" href="#/tutorial/user?id=${escapeAttr(c.author_id)}">${escapeHtml(c.author_name)}</a>
+          ${isAdmin ? `<span class="admin-tag">管理员</span>` : ""}
+          <span class="comment-time">${escapeHtml(fmtTime(c.created_at))}</span>
+        </div>
+        <div class="comment-content">${escapeHtml(c.content)}</div>
+        <div class="comment-foot">${replyBtn}${likeBtn}${delBtn}${blockBtn}</div>
+        ${children ? `<ul class="comment-list reply-list">${children}</ul>` : ""}
       </div>
-      <div class="comment-content">${escapeHtml(c.content)}</div>
-      <div class="comment-foot">${replyBtn}</div>
-      ${children ? `<ul class="comment-list reply-list">${children}</ul>` : ""}
+    </li>`;
+}
+
+function renderReply(r, me) {
+  const hue = avatarHue(r.author_name);
+  const isMine = !!(me && me.id === r.author_id);
+  const isAdmin = !!(me && me.role === "admin");
+  const canDelete = isMine || isAdmin;
+  const replyBtn = `<button class="btn-link" data-reply="${escapeAttr(r.id)}" data-reply-to="${escapeAttr(r.author_name)}">回复</button>`;
+  const likeBtn = `<button class="btn-link cmt-like ${r.liked ? "active" : ""}" data-clike="${escapeAttr(r.id)}">👍 <span class="count">${r.likes || 0}</span></button>`;
+  const delBtn = canDelete ? `<button class="btn-link danger" data-cdel="${escapeAttr(r.id)}">删除</button>` : "";
+  const blockBtn = (me && me.id !== r.author_id) ? `<button class="btn-link danger" data-cblock="${escapeAttr(r.author_id)}" data-cname="${escapeAttr(r.author_name)}">屏蔽</button>` : "";
+  return `
+    <li class="comment-item reply">
+      <a class="comment-avatar" href="#/tutorial/user?id=${escapeAttr(r.author_id)}" style="background:hsl(${hue},62%,52%)">${escapeHtml(avatarChar(r.author_name))}</a>
+      <div class="comment-main">
+        <div class="comment-head">
+          <a class="comment-author" href="#/tutorial/user?id=${escapeAttr(r.author_id)}">${escapeHtml(r.author_name)}</a>
+          ${isAdmin ? `<span class="admin-tag">管理员</span>` : ""}
+          <span class="comment-time">${escapeHtml(fmtTime(r.created_at))}</span>
+        </div>
+        <div class="comment-content">${escapeHtml(r.content)}</div>
+        <div class="comment-foot">${replyBtn}${likeBtn}${delBtn}${blockBtn}</div>
+      </div>
     </li>`;
 }
 
@@ -1286,11 +1475,26 @@ function bindDetailActions() {
       location.hash = `#/tutorial/edit?id=${encodeURIComponent(editBtn.dataset.edit)}`;
       return;
     }
+    const delBtn = e.target.closest("button[data-del]");
+    if (delBtn) { handleResourceDelete(delBtn.dataset.del); return; }
+    const clikeBtn = e.target.closest("button[data-clike]");
+    if (clikeBtn) { handleCommentLike(clikeBtn.dataset.clike, clikeBtn); return; }
+    const cdelBtn = e.target.closest("button[data-cdel]");
+    if (cdelBtn) { handleCommentDelete(cdelBtn.dataset.cdel); return; }
+    const cblockBtn = e.target.closest("button[data-cblock]");
+    if (cblockBtn) { handleCommentBlock(cblockBtn.dataset.cblock, cblockBtn.dataset.cname); return; }
+    const csortBtn = e.target.closest("button[data-csort]");
+    if (csortBtn) {
+      commentSort = csortBtn.dataset.csort;
+      document.querySelectorAll(".csort-btn").forEach((b) => b.classList.toggle("active", b === csortBtn));
+      loadCommentsWithSort();
+      return;
+    }
   });
   const submit = $("commentSubmit");
   const ta = $("commentText");
   on(submit, "click", async () => {
-    if (!getToken()) { requireLogin(); return; }
+    if (!getUser()) { requireLogin(); return; }
     const content = ta.value.trim();
     if (!content) { alert("评论内容不能为空"); return; }
     const parentId = ta.dataset.parentId || null;
@@ -1305,9 +1509,71 @@ function bindDetailActions() {
       ta.value = "";
       delete ta.dataset.parentId;
       ta.placeholder = "写下你的评论或提问…";
+      loadCommentsWithSort();
       loadResourceDetail();
     } catch (err) { alert("评论失败：" + err.message); }
   });
+}
+
+async function handleResourceDelete(resId) {
+  if (!getUser()) { requireLogin(); return; }
+  const me = getUser();
+  let reason = "";
+  if (me && me.role === "admin") {
+    reason = window.prompt("删除原因（可选，将通知作者）：") || "";
+  }
+  if (!confirm("确定删除这篇帖子？此操作不可撤销。")) return;
+  try {
+    const qs = reason ? `?reason=${encodeURIComponent(reason)}` : "";
+    const res = await fetch(`${API_BASE}/api/v1/resources/${resId}${qs}`, {
+      method: "DELETE", headers: authHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    alert("已删除");
+    location.hash = "#/tutorial/resources";
+  } catch (err) { alert("删除失败：" + err.message); }
+}
+
+async function handleCommentLike(commentId, btn) {
+  if (!getUser()) { requireLogin(); return; }
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/resources/${detailResId}/comments/${commentId}/like`, {
+      method: "POST", headers: authHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    btn.classList.toggle("active", data.liked);
+    const countEl = btn.querySelector(".count");
+    if (countEl) countEl.textContent = data.likes;
+  } catch (err) { alert("操作失败：" + err.message); }
+}
+
+async function handleCommentDelete(commentId) {
+  if (!getUser()) { requireLogin(); return; }
+  if (!confirm("确定删除这条评论？")) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/resources/${detailResId}/comments/${commentId}`, {
+      method: "DELETE", headers: authHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    loadCommentsWithSort();
+  } catch (err) { alert("删除失败：" + err.message); }
+}
+
+async function handleCommentBlock(userId, userName) {
+  if (!getUser()) { requireLogin(); return; }
+  if (!confirm(`确定屏蔽 ${userName}？屏蔽后双方无法互相评论、查看主页、私信。`)) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/notifications/blocks`, {
+      method: "POST", headers: authHeaders(), body: JSON.stringify({ user_id: userId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    alert("已屏蔽");
+    loadCommentsWithSort();
+  } catch (err) { alert("屏蔽失败：" + err.message); }
 }
 
 /* ---------------- 我的收藏 / 我的上传 ---------------- */
@@ -1409,6 +1675,9 @@ function renderProfilePage() {
         <a class="profile-menu-item" href="#/tutorial/upload">
           <span class="pm-icon">⬆️</span><div class="pm-text"><b>上传资源</b><small>发布教程 / 模型 / 资料</small></div><span class="pm-arrow">›</span>
         </a>
+        <a class="profile-menu-item" href="#/tutorial/settings">
+          <span class="pm-icon">⚙️</span><div class="pm-text"><b>设置</b><small>AI 配置 · 隐私 · 通知偏好</small></div><span class="pm-arrow">›</span>
+        </a>
         <a class="profile-menu-item" href="#/tutorial/admin" id="profileAdmin" style="display:none">
           <span class="pm-icon">🛡️</span><div class="pm-text"><b>管理后台</b><small>审核资源、查看平台数据</small></div><span class="pm-arrow">›</span>
         </a>
@@ -1484,6 +1753,17 @@ function renderAdminPage() {
       <div id="adminLoading" class="loading">正在加载审核队列…</div>
       <ul id="adminList" class="res-list"></ul>
       <div id="adminEmpty" class="empty" hidden>🎉 当前没有待审核或已驳回的资源。</div>
+    </section>
+    <section class="dash">
+      <h3 class="dash-title">🗂️ 分类管理</h3>
+      <p class="block-sub" style="margin-bottom:12px">上传资源时用户从这些固定分类中选择；增删立即生效。</p>
+      <div class="cat-manage">
+        <div class="cat-manage-input">
+          <input id="newCatName" type="text" maxlength="40" placeholder="新分类名，如：插件" />
+          <button id="addCatBtn" class="btn btn-primary btn-sm">➕ 添加分类</button>
+        </div>
+        <ul id="catManageList" class="cat-manage-list"></ul>
+      </div>
     </section>
   </div>`;
 }
@@ -1600,36 +1880,562 @@ function renderAdminCard(r) {
 
 async function initAdminActions() {
   const list = $("adminList");
-  if (!list) return;
-  on(list, "click", async (e) => {
-    const btn = e.target.closest("button[data-id]");
-    if (!btn) return;
-    const id = btn.dataset.id;
-    const action = btn.classList.contains("btn-approve") ? "approve" : "reject";
-    const note = action === "reject" ? (window.prompt("驳回原因（可选）：") || "") : "";
-    btn.disabled = true;
+  if (list) {
+    on(list, "click", async (e) => {
+      const btn = e.target.closest("button[data-id]");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const action = btn.classList.contains("btn-approve") ? "approve" : "reject";
+      const note = action === "reject" ? (window.prompt("驳回原因（可选）：") || "") : "";
+      btn.disabled = true;
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/admin/resources/${id}/review`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ action, note }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        const card = $("card-" + id);
+        if (card) card.remove();
+        const remaining = list.querySelectorAll(".res-card").length;
+        const empty = $("adminEmpty");
+        if (remaining === 0 && empty) empty.hidden = false;
+        loadAdminStats();
+      } catch (err) {
+        alert("操作失败：" + err.message);
+        btn.disabled = false;
+      }
+    });
+  }
+  loadCategoryManage();
+}
+
+/* 管理后台：分类增删 */
+async function loadCategoryManage() {
+  const listEl = $("catManageList");
+  if (!listEl) return;
+  const render = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/resources/${id}/review`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({ action, note }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
-      const card = $("card-" + id);
-      if (card) card.remove();
-      const remaining = list.querySelectorAll(".res-card").length;
-      const empty = $("adminEmpty");
-      if (remaining === 0 && empty) empty.hidden = false;
-      loadAdminStats();
-    } catch (err) {
-      alert("操作失败：" + err.message);
-      btn.disabled = false;
-    }
+      const res = await fetch(`${API_BASE}/api/v1/admin/resources/categories`, { headers: authHeaders() });
+      if (!res.ok) { listEl.innerHTML = `<li class="item-empty">⚠️ 加载失败</li>`; return; }
+      const data = await res.json();
+      const cats = data.categories || [];
+      listEl.innerHTML = cats.map((c) =>
+        `<li class="cat-manage-item">
+          <span class="tag">#${escapeHtml(c)}</span>
+          <button class="btn-link danger" data-rmcat="${escapeAttr(c)}">移除</button>
+        </li>`).join("") || `<li class="item-empty">暂无分类</li>`;
+      listEl.querySelectorAll("[data-rmcat]").forEach((btn) => on(btn, "click", async () => {
+        if (!confirm(`确定移除分类「${btn.dataset.rmcat}」？已有资源不受影响。`)) return;
+        const r = await fetch(`${API_BASE}/api/v1/admin/resources/categories`, {
+          method: "POST", headers: authHeaders(),
+          body: JSON.stringify({ action: "remove", name: btn.dataset.rmcat }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { alert(d.detail || "移除失败"); return; }
+        render();
+      }));
+    } catch (e) { listEl.innerHTML = `<li class="item-empty">⚠️ 加载失败：${escapeHtml(e.message)}</li>`; }
+  };
+  await render();
+  on($("addCatBtn"), "click", async () => {
+    const nameInput = $("newCatName");
+    const name = nameInput.value.trim();
+    if (!name) { alert("请输入分类名"); return; }
+    const r = await fetch(`${API_BASE}/api/v1/admin/resources/categories`, {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ action: "add", name }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { alert(d.detail || "添加失败"); return; }
+    nameInput.value = "";
+    render();
   });
 }
-/* ---------------- AI 设置弹窗 ---------------- */
-let providers = [];
+/* ---------------- 搜索页 ---------------- */
+function renderSearchPage() {
+  const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
+  currentPage = { type: "search" };
+  return `<div class="page">
+    <section class="hero">
+      <h1 class="hero-title">🔍 全站搜索</h1>
+      <p class="hero-sub">搜索已通过的教程 / 模型 / 资料资源</p>
+    </section>
+    <div class="search-hero">
+      <input id="searchBigInput" type="search" placeholder="输入关键词搜索标题 / 简介 / 标签 / 作者…" value="${escapeAttr(q)}" autocomplete="off" />
+      <button id="searchBigBtn" class="btn btn-primary">搜索</button>
+    </div>
+    <div class="res-toolbar" style="margin-top:16px">
+      <select id="searchSort" class="res-sort">
+        <option value="latest">🕒 最新</option>
+        <option value="hottest">🔥 最热</option>
+        <option value="downloads">⬇️ 最多下载</option>
+        <option value="likes">👍 最多点赞</option>
+      </select>
+    </div>
+    <div id="searchLoading" class="loading" style="margin-top:16px">正在搜索…</div>
+    <ul id="searchList" class="res-list"></ul>
+    <div id="searchEmpty" class="empty" hidden></div>
+  </div>`;
+}
+
+async function loadSearchPage() {
+  const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
+  const input = $("searchBigInput");
+  const list = $("searchList");
+  const empty = $("searchEmpty");
+  const loading = $("searchLoading");
+  const sortSel = $("searchSort");
+  if (!list) return;
+  let sort = "latest";
+
+  const doSearch = async () => {
+    const kw = (input ? input.value.trim() : q) || q;
+    if (!kw) {
+      if (empty) { empty.hidden = false; empty.textContent = "请输入搜索关键词"; }
+      if (loading) loading.hidden = true;
+      if (list) list.innerHTML = "";
+      return;
+    }
+    if (loading) loading.hidden = false;
+    if (empty) empty.hidden = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/resources/search?q=${encodeURIComponent(kw)}&sort=${sort}`);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      if (empty) { empty.hidden = data.length > 0; if (!data.length) empty.textContent = `未找到“${kw}”相关资源`; }
+      if (list) list.innerHTML = data.map(renderResourceCard).join("");
+      // 重新绑定点赞/收藏
+      if (list) list.onclick = null;
+      bindResourceListActions(list);
+    } catch (err) {
+      if (empty) { empty.hidden = false; empty.textContent = "⚠️ 搜索失败：" + err.message; }
+    } finally {
+      if (loading) loading.hidden = true;
+    }
+  };
+
+  on($("searchBigBtn"), "click", () => { location.hash = `#/tutorial/search?q=${encodeURIComponent((input ? input.value.trim() : "") || "")}`; doSearch(); });
+  if (input) on(input, "keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  if (sortSel) on(sortSel, "change", () => { sort = sortSel.value; doSearch(); });
+  if (q) doSearch();
+}
+
+function bindResourceListActions(list) {
+  on(list, "click", (e) => {
+    const dl = e.target.closest("a[data-download]");
+    if (dl) {
+      const id = dl.dataset.download;
+      if (id) fetch(`${API_BASE}/api/v1/resources/${id}/download`, { method: "POST" }).catch(() => {});
+      return;
+    }
+    const likeBtn = e.target.closest("button[data-like]");
+    if (likeBtn) { handleLike(likeBtn.dataset.like, likeBtn); return; }
+    const favBtn = e.target.closest("button[data-fav]");
+    if (favBtn) { handleFavorite(favBtn.dataset.fav, favBtn); return; }
+  });
+}
+/* ---------------- 通知中心 ---------------- */
+function renderNotificationsPage() {
+  currentPage = { type: "notifications" };
+  return `<div class="page">
+    <section class="hero">
+      <h1 class="hero-title">🔔 消息通知</h1>
+      <p class="hero-sub">私信与系统通知（点赞 / 回复 / 系统消息）</p>
+    </section>
+    <div class="notify-layout">
+      <aside class="notify-sidebar">
+        <button class="notify-tab active" data-tab="all">🔔 全部通知</button>
+        <button class="notify-tab" data-tab="unread">✨ 未读</button>
+        <button class="notify-tab" data-tab="messages">💬 私信</button>
+        <button class="notify-tab" data-tab="blocked">🚫 屏蔽名单</button>
+        <button class="notify-tab" data-tab="config">⚙️ 通知设置</button>
+      </aside>
+      <div class="notify-main" id="notifyMain"></div>
+    </div>
+  </div>`;
+}
+
+async function loadNotificationsPage() {
+  if (!getUser()) { requireLogin(); return; }
+  const main = $("notifyMain");
+  const tabs = document.querySelectorAll(".notify-tab");
+  let currentTab = "all";
+
+  const renderTab = async (tab) => {
+    currentTab = tab;
+    tabs.forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+    if (!main) return;
+    main.innerHTML = `<div class="loading">加载中…</div>`;
+    try {
+      if (tab === "messages") {
+        const res = await fetch(`${API_BASE}/api/v1/notifications/messages/peers`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const peers = await res.json();
+        main.innerHTML = peers.length
+          ? `<ul class="dm-list">${peers.map((p) => `
+            <li class="dm-item" data-peer="${escapeAttr(p.peer_id)}">
+              <span class="dm-avatar" style="background:hsl(${avatarHue(p.peer_name)},62%,52%)">${escapeHtml(avatarChar(p.peer_name))}</span>
+              <div class="dm-body">
+                <div class="dm-head"><b>${escapeHtml(p.peer_name)}</b>${p.unread ? `<span class="dm-unread">${p.unread}</span>` : ""}</div>
+                <div class="dm-last">${escapeHtml(p.last_content || "")}</div>
+              </div>
+            </li>`).join("")}</ul>`
+          : `<div class="empty">暂无私信</div>`;
+        main.querySelectorAll(".dm-item").forEach((li) => on(li, "click", () => openConversation(li.dataset.peer, li.querySelector(".dm-head b").textContent)));
+      } else if (tab === "blocked") {
+        const res = await fetch(`${API_BASE}/api/v1/notifications/blocks`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const blocks = await res.json();
+        main.innerHTML = blocks.length
+          ? `<ul class="block-list">${blocks.map((b) => `
+            <li class="block-item">
+              <span>${escapeHtml(b.username || b.user_id)}</span>
+              <button class="btn btn-ghost btn-sm" data-unblock="${escapeAttr(b.user_id)}">解除屏蔽</button>
+            </li>`).join("")}</ul>`
+          : `<div class="empty">尚未屏蔽任何人</div>`;
+        main.querySelectorAll("[data-unblock]").forEach((btn) => on(btn, "click", async () => {
+          await fetch(`${API_BASE}/api/v1/notifications/blocks/${btn.dataset.unblock}`, { method: "DELETE" });
+          renderTab("blocked");
+        }));
+      } else if (tab === "config") {
+        main.innerHTML = renderNotifyConfig();
+        initNotifyConfig();
+      } else {
+        const unreadOnly = tab === "unread" ? "?unread=1" : "";
+        const res = await fetch(`${API_BASE}/api/v1/notifications${unreadOnly}`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const items = data.notifications || [];
+        main.innerHTML = items.length
+          ? `<button class="btn btn-ghost btn-sm" id="markAllRead" style="margin-bottom:12px">全部已读</button>
+             <ul class="notif-list">${items.map(renderNotificationItem).join("")}</ul>`
+          : `<div class="empty">${tab === "unread" ? "没有未读通知" : "暂无通知"}</div>`;
+        const mar = $("markAllRead");
+        if (mar) on(mar, "click", async () => {
+          await fetch(`${API_BASE}/api/v1/notifications/read`, { method: "POST" });
+          renderTab(currentTab);
+          pollUnread();
+        });
+        main.querySelectorAll("[data-notif]").forEach((a) => on(a, "click", async () => {
+          await fetch(`${API_BASE}/api/v1/notifications/read/${a.dataset.notif}`, { method: "POST" });
+          pollUnread();
+        }));
+      }
+    } catch (err) {
+      main.innerHTML = `<div class="empty">⚠️ 加载失败：${escapeHtml(err.message)}</div>`;
+    }
+  };
+
+  tabs.forEach((t) => on(t, "click", () => renderTab(t.dataset.tab)));
+  renderTab("all");
+}
+
+function renderNotificationItem(n) {
+  const iconMap = { like_comment: "👍", like_post: "❤️", reply_comment: "💬", reply_post: "💬", system: "⚙️" };
+  const icon = iconMap[n.type] || "🔔";
+  const cls = n.is_read ? "" : " unread";
+  const inner = n.link ? `<a class="notif-item${cls}" data-notif="${escapeAttr(n.id)}" href="${escapeAttr(n.link)}">` : `<div class="notif-item${cls}" data-notif="${escapeAttr(n.id)}">`;
+  const close = n.link ? "</a>" : "</div>";
+  return `${inner}
+    <span class="notif-icon">${icon}</span>
+    <div class="notif-body">
+      <div class="notif-text">${escapeHtml(n.content)}</div>
+      <div class="notif-time">${escapeHtml(fmtTime(n.created_at))}</div>
+    </div>${close}`;
+}
+
+let activeConversation = null;
+async function openConversation(peerId, peerName) {
+  const main = $("notifyMain");
+  if (!main) return;
+  activeConversation = { peerId, peerName };
+  await renderConversation();
+}
+
+async function renderConversation() {
+  const main = $("notifyMain");
+  if (!main || !activeConversation) return;
+  const { peerId, peerName } = activeConversation;
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/notifications/messages/${peerId}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const msgs = await res.json();
+    const me = getUser();
+    main.innerHTML = `
+      <div class="chat-head">
+        <button class="btn-link" id="backToPeers">← 返回</button>
+        <b>与 ${escapeHtml(peerName)} 的私信</b>
+      </div>
+      <div class="chat-body">
+        ${msgs.map((m) => {
+          const mine = m.from_id === me.id;
+          return `<div class="chat-msg ${mine ? "mine" : ""}">
+            <div class="chat-bubble">${escapeHtml(m.content)}</div>
+            <div class="chat-time">${escapeHtml(fmtTime(m.created_at))}</div>
+          </div>`;
+        }).join("")}
+      </div>
+      <div class="chat-input">
+        <textarea id="chatText" placeholder="发送私信…"></textarea>
+        <button id="chatSend" class="btn btn-primary">发送</button>
+      </div>`;
+    on($("backToPeers"), "click", () => {
+      activeConversation = null;
+      const tabs = document.querySelectorAll(".notify-tab");
+      tabs.forEach((t) => t.classList.toggle("active", t.dataset.tab === "messages"));
+      loadNotificationsPage();
+    });
+    on($("chatSend"), "click", async () => {
+      const ta = $("chatText");
+      const content = ta.value.trim();
+      if (!content) return;
+      const r = await fetch(`${API_BASE}/api/v1/notifications/messages`, {
+        method: "POST", headers: authHeaders(),
+        body: JSON.stringify({ to_id: peerId, content }),
+      });
+      if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || "发送失败"); return; }
+      renderConversation();
+    });
+  } catch (err) {
+    main.innerHTML = `<div class="empty">⚠️ 加载失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderNotifyConfig() {
+  return `<div class="profile-wrap">
+    <section class="profile-card">
+      <h3 style="margin-bottom:14px">⚙️ 通知与隐私设置</h3>
+      <label class="switch-row"><span>点赞提醒 <small>有人赞我的评论时通知我</small></span>
+        <input type="checkbox" class="nf-switch" data-key="notify_like" /></label>
+      <label class="switch-row"><span>回复提醒 <small>有人回复我的评论/帖子时通知我</small></span>
+        <input type="checkbox" class="nf-switch" data-key="notify_reply" /></label>
+      <label class="switch-row"><span>公开我的收藏 <small>允许他人查看我的收藏列表</small></span>
+        <input type="checkbox" class="nf-switch" data-key="show_favorites" /></label>
+    </section>
+    <section class="profile-card">
+      <h3 style="margin-bottom:14px">✏️ 个人签名</h3>
+      <textarea id="bioText" maxlength="200" placeholder="介绍一下自己…" rows="4" style="width:100%"></textarea>
+      <div style="margin-top:12px;text-align:right"><button id="saveProfile" class="btn btn-primary">保存</button></div>
+    </section>
+  </div>`;
+}
+
+async function initNotifyConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/users/me/profile`);
+    const data = await res.json();
+    const prof = (data.user && data.user.profile) || {};
+    document.querySelectorAll(".nf-switch").forEach((sw) => {
+      sw.checked = !!prof[sw.dataset.key];
+    });
+    const bio = $("bioText");
+    if (bio) bio.value = prof.bio || "";
+  } catch (e) {}
+  document.querySelectorAll(".nf-switch").forEach((sw) => on(sw, "change", () => saveProfile()));
+  on($("saveProfile"), "click", () => saveProfile());
+}
+
+async function saveProfile() {
+  const body = { bio: ($("bioText") || {}).value };
+  document.querySelectorAll(".nf-switch").forEach((sw) => { body[sw.dataset.key] = sw.checked; });
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/users/me/profile`, {
+      method: "PATCH", headers: authHeaders(), body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    alert("✅ 已保存");
+  } catch (e) { alert("保存失败：" + e.message); }
+}
+
+/* ---------------- 用户主页（他人视角） ---------------- */
+function renderUserPage() {
+  currentPage = { type: "user" };
+  return `<div class="page">
+    <section class="hero">
+      <h1 class="hero-title">👤 用户主页</h1>
+      <p class="hero-sub">查看用户资料与公开动态</p>
+    </section>
+    <div id="userWrap" class="loading">加载中…</div>
+  </div>`;
+}
+
+async function loadUserPage() {
+  const mid = (location.hash.split("?")[1] || "").split("&").find((p) => p.startsWith("id="));
+  const userId = mid ? decodeURIComponent(mid.slice(3)) : "";
+  if (!userId) { $("userWrap").innerHTML = `<div class="empty">缺少用户 ID</div>`; return; }
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/users/${encodeURIComponent(userId)}/profile`);
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      $("userWrap").className = "empty";
+      $("userWrap").innerHTML = `<div class="empty">⚠️ ${escapeHtml(d.detail || "无法查看该用户")}</div>`;
+      return;
+    }
+    const data = await res.json();
+    const u = data.user;
+    const hue = avatarHue(u.username);
+    const me = getUser();
+    const canMsg = !!me && me.id !== u.id;
+    $("userWrap").className = "";
+    $("userWrap").innerHTML = `
+      <div class="profile-wrap">
+        <section class="profile-card">
+          <div class="profile-head">
+            <span class="avatar" style="background:hsl(${hue},62%,52%)">${escapeHtml(avatarChar(u.username))}</span>
+            <div class="profile-info">
+              <div class="profile-name">${escapeHtml(u.username)}</div>
+              <div class="profile-meta">${u.role === "admin" ? "管理员" : "普通用户"} · 注册于 ${escapeHtml(fmtTime(u.created_at).slice(0, 10))}</div>
+            </div>
+            <div style="display:flex;gap:8px">
+              ${canMsg ? `<button class="btn btn-primary btn-sm" id="dmUserBtn">💬 私信</button>` : ""}
+              ${me && me.id !== u.id ? `<button class="btn btn-ghost btn-sm" id="blockUserBtn">🚫 屏蔽</button>` : ""}
+            </div>
+          </div>
+          ${(u.profile && u.profile.bio) ? `<div class="profile-bio">${escapeHtml(u.profile.bio)}</div>` : ""}
+          <div class="profile-stats">
+            <div class="ps-item"><b>${data.stats.uploads}</b><span>上传</span></div>
+            <div class="ps-item"><b>${data.stats.likes_received}</b><span>获赞</span></div>
+            <div class="ps-item"><b>${data.stats.favorites_received}</b><span>被收藏</span></div>
+            <div class="ps-item"><b>${data.stats.comments_made}</b><span>评论</span></div>
+          </div>
+        </section>
+      </div>`;
+    const dmBtn = $("dmUserBtn");
+    if (dmBtn) on(dmBtn, "click", () => {
+      location.hash = "#/tutorial/notifications";
+      setTimeout(() => { const t = document.querySelector('.notify-tab[data-tab="messages"]'); if (t) t.click(); }, 200);
+      // 直接打开与该用户的会话
+      setTimeout(() => openConversation(u.id, u.username), 350);
+    });
+    const blockBtn = $("blockUserBtn");
+    if (blockBtn) on(blockBtn, "click", async () => {
+      if (!confirm(`确定屏蔽 ${u.username}？屏蔽后双方无法互相评论、查看主页、私信。`)) return;
+      const r = await fetch(`${API_BASE}/api/v1/notifications/blocks`, {
+        method: "POST", headers: authHeaders(), body: JSON.stringify({ user_id: u.id }),
+      });
+      if (r.ok) { alert("已屏蔽"); location.hash = "#/tutorial/platform"; }
+      else { const d = await r.json().catch(() => ({})); alert(d.detail || "屏蔽失败"); }
+    });
+  } catch (e) {
+    $("userWrap").className = "empty";
+    $("userWrap").innerHTML = `<div class="empty">⚠️ 加载失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* ---------------- 设置页（分栏） ---------------- */
+function renderSettingsPage() {
+  currentPage = { type: "settings" };
+  return `<div class="page">
+    <section class="hero">
+      <h1 class="hero-title">⚙️ 设置</h1>
+      <p class="hero-sub">AI 配置 · 账户隐私 · 通知偏好</p>
+    </section>
+    <div class="settings-layout">
+      <aside class="settings-nav">
+        <button class="settings-tab active" data-tab="ai">🤖 AI 设置</button>
+        <button class="settings-tab" data-tab="privacy">🔒 隐私设置</button>
+        <button class="settings-tab" data-tab="notify">🔔 通知偏好</button>
+        <button class="settings-tab" data-tab="account">👤 账户设置</button>
+      </aside>
+      <div class="settings-main" id="settingsMain"></div>
+    </div>
+  </div>`;
+}
+
+async function loadSettingsPage() {
+  if (!getUser()) { requireLogin(); return; }
+  const main = $("settingsMain");
+  const tabs = document.querySelectorAll(".settings-tab");
+  const renderTab = async (tab) => {
+    tabs.forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+    if (tab === "ai") {
+      main.innerHTML = aiSettingsPanelHtml();
+      bindAiSettingsPanel();
+    } else if (tab === "privacy") {
+      main.innerHTML = `<div class="profile-card"><h3 style="margin-bottom:14px">🔒 隐私设置</h3>${renderNotifyConfig()}</div>`;
+      initNotifyConfig();
+    } else if (tab === "notify") {
+      main.innerHTML = `<div class="profile-card"><h3 style="margin-bottom:14px">🔔 通知偏好</h3>${renderNotifyConfig()}</div>`;
+      initNotifyConfig();
+    } else if (tab === "account") {
+      const u = getUser();
+      main.innerHTML = `<div class="profile-card">
+        <h3 style="margin-bottom:14px">👤 账户信息</h3>
+        <div class="acc-row"><span>用户名</span><b>${escapeHtml(u.username)}</b></div>
+        <div class="acc-row"><span>角色</span><b>${u.role === "admin" ? "管理员" : "普通用户"}</b></div>
+        <div class="acc-row"><span>注册时间</span><b>${escapeHtml(fmtTime(u.created_at))}</b></div>
+        <div style="margin-top:16px"><button id="accLogout" class="btn btn-ghost">退出登录</button></div>
+      </div>`;
+      on($("accLogout"), "click", async () => {
+        try { await fetch(`${API_BASE}/api/v1/auth/logout`, { method: "POST" }); } catch (e) {}
+        clearSession();
+        location.hash = "#/tutorial/platform";
+      });
+    }
+  };
+  tabs.forEach((t) => on(t, "click", () => renderTab(t.dataset.tab)));
+  renderTab("ai");
+}
+
+/* AI 设置面板（从弹窗改造为分栏内嵌，复用原逻辑） */
+function aiSettingsPanelHtml() {
+  return `<div class="profile-card">
+    <h3 style="margin-bottom:14px">🤖 AI 服务配置</h3>
+    <p class="hint" style="margin-bottom:16px">配置 OpenAI 兼容接口（DeepSeek / OpenAI / 通义 / 智谱 等），Key 仅保存在本地后端，不会上传到第三方。</p>
+    <label class="field"><span>服务商模板</span><select id="cfgProvider"><option value="">— 自定义 —</option></select><small>选择后自动填入 Base URL</small></label>
+    <label class="field"><span>API Base URL</span><input id="cfgBaseUrl" type="text" placeholder="https://api.deepseek.com/v1" /><small>仅支持公网 https/http，内网地址会被安全拦截</small></label>
+    <div class="field"><span>模型</span>
+      <div class="model-row">
+        <input id="cfgModel" type="text" list="modelList" placeholder="deepseek-chat / gpt-4o-mini" />
+        <button id="fetchModelsBtn" class="btn btn-ghost btn-sm" type="button" title="从服务商自动拉取模型列表">🔄 获取模型</button>
+      </div>
+      <datalist id="modelList"></datalist>
+      <small id="modelsStatus" class="key-status"></small>
+    </div>
+    <label class="field"><span>API Key</span><input id="cfgApiKey" type="password" placeholder="sk-..." autocomplete="off" /><small id="keyStatus" class="key-status"></small>
+      <button id="clearKeyBtn" class="btn-link" type="button" hidden>🗑️ 清除已保存的 Key</button></label>
+    <label class="field" id="adminTokenField" hidden><span>管理令牌</span><input id="cfgAdminToken" type="password" placeholder="后端 EMOERA_ADMIN_TOKEN 的值" autocomplete="off" /><small>修改 / 测试配置需要该令牌</small></label>
+    <div id="testResult" class="test-result" hidden></div>
+    <div style="margin-top:16px;display:flex;gap:10px">
+      <button id="testBtn" class="btn btn-ghost">测试连接</button>
+      <span class="flex-spacer"></span>
+      <button id="saveBtn" class="btn btn-primary">保存</button>
+    </div>
+  </div>`;
+}
+
+function bindAiSettingsPanel() {
+  // 复用原 openSettings 的载入逻辑（内嵌版）
+  loadProviders();
+  (async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/settings/ai`);
+      if (!res.ok) return;
+      const cfg = await res.json();
+      $("cfgBaseUrl").value = cfg.base_url || "";
+      $("cfgModel").value = cfg.model || "";
+      $("cfgApiKey").value = "";
+      $("cfgAdminToken").value = "";
+      $("keyStatus").textContent = cfg.api_key_set ? `✅ 已配置 Key（${cfg.api_key_masked}）` : "尚未配置 Key";
+      $("modelsStatus").textContent = "";
+      $("adminTokenField").hidden = !cfg.admin_token_required;
+      currentAiConfig = cfg;
+      $("clearKeyBtn").hidden = !cfg.api_key_set;
+    } catch (e) { $("keyStatus").textContent = "⚠️ 无法读取配置：" + e.message; }
+  })();
+  on($("cfgProvider"), "change", () => {
+    const p = providers.find((x) => x.key === $("cfgProvider").value);
+    if (p) $("cfgBaseUrl").value = p.base_url;
+  });
+  on($("testBtn"), "click", testConnection);
+  on($("fetchModelsBtn"), "click", fetchModels);
+  on($("clearKeyBtn"), "click", clearKey);
+  on($("saveBtn"), "click", saveSettings);
+}
+
+
 let currentAiConfig = null;
 
 function setStatus(el, text, isErr = false) {
@@ -1840,7 +2646,11 @@ function renderPage(state) {
       case "edit": html = renderEditPage(); break;
       case "login": html = renderLoginPage(); break;
       case "profile": html = renderProfilePage(); break;
+      case "user": html = renderUserPage(); break;
       case "admin": html = renderAdminPage(); break;
+      case "search": html = renderSearchPage(); break;
+      case "notifications": html = renderNotificationsPage(); break;
+      case "settings": html = renderSettingsPage(); break;
       default: html = renderPlatformHome();
     }
   }
@@ -1862,7 +2672,11 @@ function renderPage(state) {
       case "upload": initUpload(); break;
       case "login": initLogin(); break;
       case "profile": renderProfile(); break;
+      case "user": loadUserPage(); break;
       case "admin": loadAdminStats(); loadAdminQueue(); initAdminActions(); break;
+      case "search": loadSearchPage(); break;
+      case "notifications": loadNotificationsPage(); break;
+      case "settings": loadSettingsPage(); break;
     }
   }
 }
@@ -1875,7 +2689,7 @@ function route() {
       return;
     }
   } else {
-    const valid = ["platform", "resources", "upload", "favorites", "my_resources", "resource", "edit", "login", "profile", "admin"];
+    const valid = ["platform", "resources", "upload", "favorites", "my_resources", "resource", "edit", "login", "profile", "user", "admin", "search", "notifications", "settings"];
     if (!valid.includes(state.page)) {
       location.hash = "#/tutorial/platform";
       return;
@@ -1885,7 +2699,7 @@ function route() {
 }
 
 function bindGlobalEvents() {
-  on($("settingsBtn"), "click", openSettings);
+  on($("settingsBtn"), "click", () => { location.hash = "#/tutorial/settings"; });
   on($("themeBtn"), "click", toggleTheme);
   on($("testBtn"), "click", testConnection);
   on($("fetchModelsBtn"), "click", fetchModels);

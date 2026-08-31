@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 60" width="200" height="60">
+  <rect width="200" height="60" rx="12" fill="#0f172a"/>
+  <circle cx="34" cy="30" r="18" fill="#38bdf8"/>
+  <path d="M28 30 L34 22 L40 30 L34 38 Z" fill="#0f172a"/>
+  <text x="60" y="38" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="600" fill="#f8fafc">Emoera</text>
+</svg>

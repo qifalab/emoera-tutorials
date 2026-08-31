@@ -112,6 +112,16 @@ class CommentItem(BaseModel):
     author_name: str = ""
     parent_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
+    likes: int = 0                      # 点赞数
+    liked: bool = False                 # 当前用户是否已点赞
+    # 回复时展示被回复人
+    reply_to_name: str = ""             # 被回复用户的用户名（parent 的作者）
+
+
+class CommentSort(BaseModel):
+    """评论排序请求（time 时间 / hot 热度）。"""
+
+    sort: str = Field(default="time", pattern="^(time|hot)$")
 
 
 class ResourceDetail(BaseModel):
